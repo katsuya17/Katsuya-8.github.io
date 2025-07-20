@@ -1,0 +1,583 @@
+import * as THREE from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls";
+import * as CANNON from 'cannon-es';
+
+class ThreeJSContainer {
+    private scene: THREE.Scene;
+    private light: THREE.Light;
+    public tennisBall: THREE.Mesh;
+    private tennisWall: THREE.Mesh;
+    private courtPlane: THREE.Mesh;
+
+    private cannonWorld: CANNON.World;
+    public cannonBallBody: CANNON.Body;
+    private cannonWallBody: CANNON.Body;
+    private cannonGroundBody: CANNON.Body;
+    public cannonRacketBody: CANNON.Body | null = null;
+
+    private groundMaterial: CANNON.Material;
+    private ballMaterial: CANNON.Material; 
+    private wallMaterial: CANNON.Material;
+    private courtBoundaryMaterial: CANNON.Material;
+    private racketMaterialPhysics: CANNON.Material;
+
+    // この boostedBallMaterial は現在使用されていませんが、定義は残しておきます。
+    // もし将来的に「ラケットで打つと一時的にボールの反発係数がブーストされる」
+    // といった機能を追加する際に役立ちます。
+    private boostedBallMaterial: CANNON.Material; 
+    private defaultBallRestitution: number = 0.7; // ボールが床に当たる際のデフォルト反発係数
+    private wallBallRestitution: number = 1.0; // ボールが壁に当たる際のデフォルト反発係数 (ラケットと同じ)
+
+    public ballDirection = new THREE.Vector3(0, 0, 0); 
+    public ballSpeed = 0.5;
+
+    private wallWidth: number = 20;
+    private wallHeight: number = 15;
+    private wallDepth: number = 0.2;
+
+    private courtLength: number = 15; 
+    private courtPlaneHeight: number = this.courtLength + 6; 
+
+    private courtWidthSingles: number;
+    private courtWidthDoubles: number;
+
+    private serviceLineDistance: number = 6.40;
+    private centerMarkLength: number = 0.10;
+
+    private courtLineThickness: number = 0.05;
+    private frontBaselineZ: number;
+    private courtGroundY: number = -2.1;
+    private tennisBallRadius: number = 0.5;
+    private backBaselineZ: number;
+
+    private renderer: THREE.WebGLRenderer;
+    private camera: THREE.PerspectiveCamera;
+    private orbitControls: OrbitControls;
+
+    private tennisRacketModel: THREE.Group = new THREE.Group();
+    private mouseX: number = 0;
+    private racketMoveRangeX: number;
+
+    private initialRacketRotation: THREE.Euler = new THREE.Euler(0, Math.PI, Math.PI / 2, 'XYZ');
+    private targetRacketRotationYOffset: number = 0;
+    private currentRacketQuaternion: THREE.Quaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI, Math.PI / 2));
+
+    private hitCount: number = 0;
+    // HTML要素としてカウントを表示するための参照
+    private hitCountElement: HTMLElement | null = null;
+
+
+    constructor() {
+        this.courtWidthSingles = this.wallWidth;
+        this.courtWidthDoubles = this.wallWidth;
+        this.racketMoveRangeX = this.wallWidth / 2 - 1;
+    }
+
+    public createRendererDOM = (width: number, height: number, cameraPos: THREE.Vector3) => {
+        this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.setSize(width, height);
+        this.renderer.setClearColor(new THREE.Color(0x495ed));
+        this.renderer.shadowMap.enabled = true;
+
+        this.camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+        this.camera.position.copy(cameraPos);
+        this.camera.lookAt(new THREE.Vector3(0, 0, 0));
+
+        this.orbitControls = new OrbitControls(this.camera, this.renderer.domElement);
+        this.orbitControls.enableDamping = true;
+        this.orbitControls.dampingFactor = 0.25;
+        this.orbitControls.enabled = true;
+
+        this.initPhysics();
+        this.createScene(); // シーンの構築は物理初期化後
+
+        // `createRendererDOM` の中で HTML要素を取得し、初期表示を設定します。
+        // これにより、DOM要素が確実に存在している状態でアクセスできます。
+        this.hitCountElement = document.getElementById('hitCount');
+        this.updateHitCountDisplay(); // 初期表示 (0をセット)
+
+        this.renderer.setAnimationLoop((time) => {
+            this.cannonWorld.step(1 / 60);
+
+            if (this.cannonBallBody && this.tennisBall) {
+                this.tennisBall.position.copy(this.cannonBallBody.position as any);
+                this.tennisBall.quaternion.copy(this.cannonBallBody.quaternion as any);
+            }
+
+            if (this.tennisRacketModel && this.cannonRacketBody) {
+                const targetX = this.mouseX * this.racketMoveRangeX;
+                this.tennisRacketModel.position.x += (targetX - this.tennisRacketModel.position.x) * 0.3; 
+
+                const racketCurrentX = this.tennisRacketModel.position.x;
+                const rotationFactor = 0.1;
+
+                if (racketCurrentX < -0.5) {
+                    this.targetRacketRotationYOffset = - (racketCurrentX + 0.5) * rotationFactor;
+                } else if (racketCurrentX > 0.5) {
+                    this.targetRacketRotationYOffset = - (racketCurrentX - 0.5) * rotationFactor;
+                } else {
+                    this.targetRacketRotationYOffset = 0;
+                }
+                
+                const targetQuaternion = new THREE.Quaternion().setFromEuler(
+                    new THREE.Euler(
+                        this.initialRacketRotation.x,
+                        this.initialRacketRotation.y + this.targetRacketRotationYOffset,
+                        this.initialRacketRotation.z,
+                        this.initialRacketRotation.order
+                    )
+                );
+                this.currentRacketQuaternion.slerp(targetQuaternion, 0.1);
+                this.tennisRacketModel.quaternion.copy(this.currentRacketQuaternion);
+
+                this.cannonRacketBody.position.copy(this.tennisRacketModel.position as any);
+                this.cannonRacketBody.quaternion.copy(this.currentRacketQuaternion as any);
+            }
+
+            this.orbitControls.update();
+            this.renderer.render(this.scene, this.camera);
+        });
+
+        this.renderer.domElement.style.cssFloat = "left";
+        this.renderer.domElement.style.margin = "10px"; 
+        
+        this.renderer.domElement.tabIndex = 1;
+        this.renderer.domElement.addEventListener('click', () => {
+            this.renderer.domElement.focus();
+            this.orbitControls.enabled = false;
+        });
+
+        this.renderer.domElement.addEventListener('mousemove', (event) => {
+            this.mouseX = (event.clientX / window.innerWidth) * 2 - 1;
+        });
+        this.renderer.domElement.addEventListener('mouseleave', () => {
+            this.orbitControls.enabled = true;
+        });
+
+
+        return this.renderer.domElement;
+    }
+
+    private initPhysics = () => {
+        this.cannonWorld = new CANNON.World();
+        this.cannonWorld.gravity.set(0, -9.82, 0);
+
+        this.groundMaterial = new CANNON.Material("groundMaterial");
+        this.ballMaterial = new CANNON.Material("ballMaterial"); 
+        this.wallMaterial = new CANNON.Material("wallMaterial");
+        this.courtBoundaryMaterial = new CANNON.Material("courtBoundaryMaterial");
+        this.racketMaterialPhysics = new CANNON.Material("racketMaterialPhysics");
+
+        this.boostedBallMaterial = new CANNON.Material("boostedBallMaterial"); 
+
+        // 地面とボールの衝突設定
+        const groundBallContactMaterial = new CANNON.ContactMaterial(
+            this.groundMaterial,
+            this.ballMaterial,
+            {
+                friction: 0.8,
+                restitution: this.defaultBallRestitution
+            }
+        );
+        this.cannonWorld.addContactMaterial(groundBallContactMaterial);
+
+        // 壁とボールの衝突設定
+        const wallBallContactMaterial = new CANNON.ContactMaterial(
+            this.wallMaterial,
+            this.ballMaterial,
+            {
+                friction: 0.6,
+                restitution: this.wallBallRestitution 
+            }
+        );
+        this.cannonWorld.addContactMaterial(wallBallContactMaterial);
+
+        // コート境界とボールの衝突設定
+        const boundaryBallContactMaterial = new CANNON.ContactMaterial(
+            this.courtBoundaryMaterial,
+            this.ballMaterial,
+            {
+                friction: 0.2,
+                restitution: 2.0
+            }
+        );
+        this.cannonWorld.addContactMaterial(boundaryBallContactMaterial);
+
+        // ラケットとボールの衝突設定
+        const racketBallContactMaterial = new CANNON.ContactMaterial(
+            this.racketMaterialPhysics,
+            this.ballMaterial,
+            {
+                friction: 0.1,
+                restitution: 1.9 
+            }
+        );
+        this.cannonWorld.addContactMaterial(racketBallContactMaterial);
+
+        // ボールと壁/地面の衝突イベントリスナーでカウントを増やす
+        this.cannonWorld.addEventListener('collide', (event) => {
+            const bodyA = event.bodyA;
+            const bodyB = event.bodyB;
+
+            // ボールと壁の衝突を検出
+            if ((bodyA === this.cannonBallBody && bodyB === this.cannonWallBody) ||
+                (bodyB === this.cannonBallBody && bodyA === this.cannonWallBody)) {
+                
+                console.log("Ball hit the wall!");
+                this.hitCount++; // カウントを増やす
+                this.updateHitCountDisplay(); // 表示を更新
+            }
+            // ボールと地面の衝突を検出
+            else if ((bodyA === this.cannonBallBody && bodyB === this.cannonGroundBody) ||
+                     (bodyB === this.cannonBallBody && bodyA === this.cannonGroundBody)) {
+                console.log("Ball hit the ground!");
+            }
+            // ボールとラケットの衝突を検出
+            else if ((bodyA === this.cannonBallBody && bodyB === this.cannonRacketBody) ||
+                     (bodyB === this.cannonBallBody && bodyA === this.cannonRacketBody)) {
+                console.log("Ball hit the racket!");
+            }
+        });
+    }
+
+    // 壁に当たった回数を表示するメソッド (HTML要素を更新する)
+    public updateHitCountDisplay = () => {
+        if (this.hitCountElement) {
+            this.hitCountElement.textContent = `Wall Hits: ${this.hitCount}`;
+        }
+    }
+
+    // ヒットカウントをリセットするパブリックメソッド
+    public resetHitCount = () => {
+        this.hitCount = 0;
+        this.updateHitCountDisplay(); 
+    }
+
+
+    private createScene = () => {
+        this.scene = new THREE.Scene();
+        this.scene.add(new THREE.AxesHelper(5));
+
+        // --- 1. テニス壁のコード ---
+        const wallGeometry = new THREE.BoxGeometry(this.wallWidth, this.wallHeight, this.wallDepth);
+        // 壁のマテリアル
+        const wallMaterial = new THREE.MeshStandardMaterial({ // シンプルなマテリアル
+            color: 0x336699,
+            roughness: 0.7,
+            metalness: 0.1
+        });
+        this.tennisWall = new THREE.Mesh(wallGeometry, wallMaterial); // 単一マテリアルを設定
+        this.tennisWall.position.set(0, this.wallHeight / 2 - 2, -10); // 壁の位置を確定
+        this.tennisWall.castShadow = true;
+        this.tennisWall.receiveShadow = true;
+        this.scene.add(this.tennisWall);
+
+        // 壁の物理ボディ
+        const wallShape = new CANNON.Box(new CANNON.Vec3(this.wallWidth / 2, this.wallHeight / 2, this.wallDepth / 2));
+        this.cannonWallBody = new CANNON.Body({
+            mass: 0,
+            position: new CANNON.Vec3(this.tennisWall.position.x, this.tennisWall.position.y, this.tennisWall.position.z),
+            shape: wallShape,
+            material: this.wallMaterial,
+            type: CANNON.Body.STATIC
+        });
+        this.cannonWorld.addBody(this.cannonWallBody);
+
+        // backBaselineZ の計算を壁の作成と物理ボディ追加の直後に移動
+        this.backBaselineZ = this.tennisWall.position.z + this.wallDepth / 2 + this.courtLineThickness / 2 + 0.1;
+
+
+        // --- 2. コートの地面と物理ボディ ---
+        const courtPlaneGeometry = new THREE.PlaneGeometry(this.wallWidth, this.courtPlaneHeight);
+        const courtPlaneMaterial = new THREE.MeshStandardMaterial({ color: 0x3cb371 });
+        this.courtPlane = new THREE.Mesh(courtPlaneGeometry, courtPlaneMaterial);
+        this.courtPlane.rotation.x = -Math.PI / 2;
+        this.courtPlane.position.y = this.courtGroundY;
+        this.courtPlane.position.z = this.tennisWall.position.z + this.wallDepth / 2 + this.courtLength / 2; 
+        this.courtPlane.receiveShadow = true;
+        this.scene.add(this.courtPlane);
+
+        const groundShape = new CANNON.Box(new CANNON.Vec3(this.wallWidth / 2, this.courtLineThickness / 2, this.courtPlaneHeight / 2));
+        this.cannonGroundBody = new CANNON.Body({
+            mass: 0,
+            position: new CANNON.Vec3(this.courtPlane.position.x, this.courtPlane.position.y, this.courtPlane.position.z),
+            shape: groundShape,
+            material: this.groundMaterial,
+            type: CANNON.Body.STATIC
+        });
+        this.cannonWorld.addBody(this.cannonGroundBody);
+
+
+        // --- 3. コートのライン ---
+        const courtLineMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff });
+        const lineYPosition = this.courtGroundY + this.courtLineThickness / 2;
+
+        const backBaselineLength = this.courtWidthSingles; 
+        const backBaselineGeometry = new THREE.BoxGeometry(backBaselineLength, this.courtLineThickness, this.courtLineThickness);
+        const backBaseline = new THREE.Mesh(backBaselineGeometry, courtLineMaterial);
+        backBaseline.position.set(0, lineYPosition, this.backBaselineZ);
+        this.scene.add(backBaseline);
+
+        const serviceLineLength = this.courtWidthSingles; 
+        const serviceLineGeometry = new THREE.BoxGeometry(serviceLineLength, this.courtLineThickness, this.courtLineThickness);
+        const serviceLineFront = new THREE.Mesh(serviceLineGeometry, courtLineMaterial);
+        const serviceLineZ = this.backBaselineZ + this.serviceLineDistance; 
+        serviceLineFront.position.set(0, lineYPosition, serviceLineZ);
+        this.scene.add(serviceLineFront);
+
+        const centerServiceLineLength = this.serviceLineDistance;
+        const centerServiceLineGeometry = new THREE.BoxGeometry(this.courtLineThickness, this.courtLineThickness, centerServiceLineLength);
+
+        const centerServiceLine = new THREE.Mesh(centerServiceLineGeometry, courtLineMaterial);
+        const centerServiceLineZ = (serviceLineZ + backBaseline.position.z) / 2;
+        centerServiceLine.position.set(0, lineYPosition, centerServiceLineZ);
+        this.scene.add(centerServiceLine);
+
+        const sideLineLength = this.courtLength; 
+        const sideLineOffset = this.courtWidthSingles / 2;
+        const sideLineGeometry = new THREE.BoxGeometry(this.courtLineThickness, this.courtLineThickness, sideLineLength);
+
+        const leftSideLine = new THREE.Mesh(sideLineGeometry, courtLineMaterial);
+        leftSideLine.position.set(-sideLineOffset, lineYPosition, this.backBaselineZ + this.courtLength / 2); 
+        this.scene.add(leftSideLine);
+
+        const rightSideLine = new THREE.Mesh(sideLineGeometry, courtLineMaterial);
+        rightSideLine.position.set(sideLineOffset, lineYPosition, this.backBaselineZ + this.courtLength / 2); 
+        this.scene.add(rightSideLine);
+
+        this.frontBaselineZ = this.backBaselineZ + this.courtLength - this.courtLineThickness / 2;
+
+
+        // --- 4. 壁のネットの線のコード ---
+        const netLineColor = 0xffffff;
+        const netLineThickness = 0.05;
+        const netLineMaterial = new THREE.MeshStandardMaterial({ color: netLineColor });
+
+        const netHeight = this.wallHeight / 3;
+        const horizontalNetLineGeometry = new THREE.BoxGeometry(this.wallWidth, netLineThickness, netLineThickness);
+        const horizontalNetLine = new THREE.Mesh(horizontalNetLineGeometry, netLineMaterial);
+        horizontalNetLine.position.set(0, netHeight - 2, this.tennisWall.position.z + this.wallDepth / 2 + netLineThickness / 2);
+        horizontalNetLine.castShadow = true;
+        horizontalNetLine.receiveShadow = true;
+        this.scene.add(horizontalNetLine);
+
+        const numVerticalNetLines = 5;
+        const verticalNetLineLength = this.wallHeight - netHeight;
+        const verticalNetLineTopOffset = this.wallHeight / 2 - 2;
+
+        for (let i = 0; i < numVerticalNetLines; i++) {
+            const lineGeometry = new THREE.BoxGeometry(netLineThickness, verticalNetLineLength, netLineThickness);
+            const line = new THREE.Mesh(lineGeometry, netLineMaterial);
+
+            const xPos = (i / (numVerticalNetLines - 1)) * this.wallWidth - (this.wallWidth / 2);
+            line.position.set(xPos, netHeight / 2 + verticalNetLineTopOffset, this.tennisWall.position.z + this.wallDepth / 2 + netLineThickness / 2);
+            line.castShadow = true;
+            line.receiveShadow = true;
+            this.scene.add(line);
+        }
+
+
+        // --- 5. ラケットのコード ---
+        const frameMaterial = new THREE.MeshStandardMaterial({ color: 0x8A2BE2 });
+        const stringMaterial = new THREE.MeshStandardMaterial({ color: 0x00FF00 });
+        const gripMaterial = new THREE.MeshStandardMaterial({ color: 0xFFFFFF });
+        const throatMaterial = new THREE.MeshStandardMaterial({ color: 0x0000FF });
+
+        const headFrameOuterRadius = 1.0;
+        const headFrameThickness = 0.1;
+        const headFrameDepth = 0.05;
+
+        const numSegments = 16;
+        for (let i = 0; i <= numSegments; i++) {
+            const angle = (i / numSegments) * Math.PI;
+            const x = headFrameOuterRadius * Math.cos(angle);
+            const y = headFrameOuterRadius * Math.sin(angle);
+
+            if (i < numSegments) {
+                const nextAngle = ((i + 1) / numSegments) * Math.PI;
+                const nextX = headFrameOuterRadius * Math.cos(nextAngle);
+                const nextY = -headFrameOuterRadius * Math.sin(nextAngle);
+
+                const segmentMidX = (x + nextX) / 2;
+                const segmentMidY = (y + nextY) / 2;
+                const segmentLength = Math.sqrt(Math.pow(x - nextX, 2) + Math.pow(y - nextY, 2));
+
+                const segmentGeometry = new THREE.BoxGeometry(headFrameThickness, segmentLength, headFrameDepth);
+                const segmentMesh = new THREE.Mesh(segmentGeometry, frameMaterial);
+                segmentMesh.position.set(segmentMidX, segmentMidY, 0);
+                segmentMesh.rotation.z = Math.atan2(nextY - y, nextX - x) - Math.PI / 2;
+                this.tennisRacketModel.add(segmentMesh);
+            }
+        }
+
+        for (let i = 0; i <= numSegments; i++) {
+            const angle = (i / numSegments) * Math.PI;
+            const x = headFrameOuterRadius * Math.cos(angle);
+            const y = -headFrameOuterRadius * Math.sin(angle);
+
+            if (i < numSegments) {
+                const nextAngle = ((i + 1) / numSegments) * Math.PI;
+                const nextX = headFrameOuterRadius * Math.cos(nextAngle);
+                const nextY = -headFrameOuterRadius * Math.sin(nextAngle);
+
+                const segmentMidX = (x + nextX) / 2;
+                const segmentMidY = (y + nextY) / 2;
+                const segmentLength = Math.sqrt(Math.pow(x - nextX, 2) + Math.pow(y - nextY, 2));
+                const segmentGeometry = new THREE.BoxGeometry(headFrameThickness, segmentLength, headFrameDepth);
+                const segmentMesh = new THREE.Mesh(segmentGeometry, frameMaterial);
+                segmentMesh.position.set(segmentMidX, segmentMidY, 0);
+                segmentMesh.rotation.z = Math.atan2(nextY - y, nextX - x) - Math.PI / 2;
+                this.tennisRacketModel.add(segmentMesh);
+            }
+        }
+        
+        // ストリング (網目) の追加
+        const stringGapX = 0.15;
+        const stringGapY = 0.15;
+        const stringThickness = 0.02;
+        const stringDepth = headFrameDepth * 1.5;
+
+        const innerRadiusX = headFrameOuterRadius - headFrameThickness / 2;
+        const innerRadiusY = headFrameOuterRadius - headFrameThickness / 2;
+
+        const numVerticalStrings = Math.floor(innerRadiusX * 2 / stringGapX);
+        for (let i = -numVerticalStrings / 2; i <= numVerticalStrings / 2; i++) {
+            if (Math.abs(i * stringGapX) + stringThickness / 2 > innerRadiusX) continue;
+
+            const stringGeometry = new THREE.BoxGeometry(stringThickness, innerRadiusY * 2, stringDepth);
+            const stringMesh = new THREE.Mesh(stringGeometry, stringMaterial);
+            stringMesh.position.set(i * stringGapX, 0, 0);
+            this.tennisRacketModel.add(stringMesh);
+        }
+
+        const numHorizontalStrings = Math.floor(innerRadiusY * 2 / stringGapY);
+        for (let i = -numHorizontalStrings / 2; i <= numHorizontalStrings / 2; i++) {
+            if (Math.abs(i * stringGapY) + stringThickness / 2 > innerRadiusY) continue;
+
+            const stringGeometry = new THREE.BoxGeometry(innerRadiusX * 2, stringThickness, stringDepth);
+            const stringMesh = new THREE.Mesh(stringGeometry, stringMaterial);
+            stringMesh.position.set(0, i * stringGapY, 0);
+            this.tennisRacketModel.add(stringMesh);
+        }
+
+        // スロート部分
+        const throatGeometry = new THREE.CylinderGeometry(0.1, 0.1, 0.8, 16);
+        const racketThroat = new THREE.Mesh(throatGeometry, throatMaterial);
+        racketThroat.position.y = -headFrameOuterRadius - 0.4;
+        this.tennisRacketModel.add(racketThroat);
+
+
+        // グリップ
+        const gripGeometry = new THREE.CylinderGeometry(0.15, 0.15, 1.5, 16);
+        const racketGrip = new THREE.Mesh(gripGeometry, gripMaterial);
+        racketGrip.position.y = racketThroat.position.y - (0.8 / 2) - (1.5 / 2); // グリップの位置をスロートの下に調整
+
+        this.tennisRacketModel.add(racketGrip);
+
+        // ラケットグループ全体のスケールと初期位置設定
+        this.tennisRacketModel.scale.set(1.5, 1.5, 1.5);
+        this.tennisRacketModel.quaternion.copy(this.currentRacketQuaternion);
+        
+        this.tennisRacketModel.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+            }
+        });
+        
+        this.scene.add(this.tennisRacketModel);
+        console.log("Tennis racket created procedurally and added to scene.");
+
+        // ラケットの初期X,Y,Z座標を変数で定義し、Three.jsモデルと物理ボディに適用
+        const initialRacketX = 0; // X軸は中央
+        const initialRacketY = 1; // 地面からの高さ
+        const initialRacketZ = 12; // ラケットの位置をZ軸12に設定
+
+        // Three.jsモデルの位置を初期化
+        this.tennisRacketModel.position.set(initialRacketX, initialRacketY, initialRacketZ);
+
+
+        // ラケットの物理ボディを作成
+        const racketHeadWidthPhysics = headFrameOuterRadius * 2 * this.tennisRacketModel.scale.x;
+        const racketHeadHeightPhysics = headFrameOuterRadius * 2 * this.tennisRacketModel.scale.y;
+        const racketHeadDepthPhysics = headFrameDepth * this.tennisRacketModel.scale.z;
+
+        const racketHeadShape = new CANNON.Box(new CANNON.Vec3(racketHeadWidthPhysics / 2, racketHeadHeightPhysics / 2, racketHeadDepthPhysics / 2));
+        
+        this.cannonRacketBody = new CANNON.Body({
+            mass: 0,
+            type: CANNON.Body.KINEMATIC,
+            position: new CANNON.Vec3(initialRacketX, initialRacketY, initialRacketZ), // 定義済みの変数を使用
+            shape: racketHeadShape,
+            material: this.racketMaterialPhysics
+        });
+        this.cannonRacketBody.quaternion.copy(this.tennisRacketModel.quaternion as any);
+        this.cannonWorld.addBody(this.cannonRacketBody);
+
+
+        // テニスボールのコード
+        const tennisBallGeometry = new THREE.SphereGeometry(this.tennisBallRadius, 32, 32);
+        const tennisBallMaterial = new THREE.MeshStandardMaterial({
+            color: 0xccff00,
+            roughness: 0.8,
+            metalness: 0.1
+        });
+        this.tennisBall = new THREE.Mesh(tennisBallGeometry, tennisBallMaterial);
+        this.tennisBall.position.set(0, 0.5, 5); // 初期表示位置
+        this.tennisBall.castShadow = true;
+        this.scene.add(this.tennisBall);
+
+        const ballShape = new CANNON.Sphere(this.tennisBallRadius);
+        this.cannonBallBody = new CANNON.Body({
+            mass: 1,
+            position: new CANNON.Vec3(this.tennisBall.position.x, this.tennisBall.position.y, this.tennisBall.position.z),
+            shape: ballShape,
+            material: this.ballMaterial, // ここでデフォルトのボールマテリアルを割り当て
+            type: CANNON.Body.STATIC
+        });
+        this.cannonWorld.addBody(this.cannonBallBody);
+
+        // ライトの設定
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+        this.scene.add(ambientLight);
+
+        this.light = new THREE.DirectionalLight(0xffffff, 0.8);
+        this.light.position.set(5, 5, 5).normalize();
+        this.light.castShadow = true;
+        this.scene.add(this.light);
+    }
+}
+
+window.addEventListener("DOMContentLoaded", init);
+
+function init() {
+    let container = new ThreeJSContainer();
+
+    let viewport = container.createRendererDOM(640, 480, new THREE.Vector3(0, 10, 20)); 
+    document.body.appendChild(viewport);
+
+    viewport.tabIndex = 1;
+    viewport.focus();
+
+    window.addEventListener('keydown', (event) => {
+        if (event.code === 'Space') {
+            console.log("Space key pressed! Launching ball with Cannon.js!");
+            container.cannonBallBody.position.set(0, 0.5, 5);
+            container.cannonBallBody.velocity.set(0, 0, 0);
+            container.cannonBallBody.angularVelocity.set(0, 0, 0);
+
+            container.cannonBallBody.type = CANNON.Body.DYNAMIC;
+
+            container.cannonBallBody.velocity.set(0, 7, -18); 
+        } else if (event.code === 'KeyR') { // Rキーが押されたら
+            console.log("R key pressed! Resetting ball and hit count.");
+            container.cannonBallBody.position.set(0, 0.5, 5); // 初期位置にリセット
+            container.cannonBallBody.velocity.set(0, 0, 0);     // 速度をゼロに
+            container.cannonBallBody.angularVelocity.set(0, 0, 0); // 角速度をゼロに
+            container.cannonBallBody.type = CANNON.Body.STATIC; // 静止状態に戻す
+            
+            // パブリックメソッドを呼び出してヒットカウントをリセット
+            container.resetHitCount(); 
+        }
+    });
+}
